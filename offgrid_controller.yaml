@@ -1,0 +1,305 @@
+esphome:
+  name: offgrid_controller
+  platform: ESP32
+  board: esp32-poe
+  includes:
+    - inverter_utils.h
+
+external_components:
+  - source: github://aguglie/esphome-rp6000@main
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Rome
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+
+sun:
+  id: sun_position
+  latitude: !secret latitude
+  longitude: !secret longitude
+
+web_server:
+  port: 80
+  ota: false
+
+ota:
+  password: ""
+
+api:
+  reboot_timeout: "0s"
+
+#ethernet:
+#  type: LAN8720
+#  mdc_pin: GPIO23
+#  mdio_pin: GPIO18
+#  clk_mode: GPIO17_OUT
+#  phy_addr: 0
+#  power_pin: GPIO12
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: info
+
+uart:
+  - id: uart_bus
+    tx_pin: 4
+    rx_pin: 36
+    baud_rate: 2400
+    debug:
+      direction: BOTH
+      dummy_receiver: false
+      after:
+        delimiter: "\n"
+      sequence:
+        - lambda: UARTDebug::log_string(direction, bytes);
+
+  - id: pzm_uart
+    tx_pin: 14
+    rx_pin: 13
+    baud_rate: 9600
+    stop_bits: 2
+
+modbus:
+  - id: modbus_pzemac
+    uart_id: pzm_uart
+    send_wait_time: 20ms
+
+rp6000:
+  - uart_id: uart_bus
+    id: inverter
+
+sensor:
+  - platform: uptime
+    name: Uptime Sensor
+
+  - platform: pzemac
+    power:
+      id: grid_consumption_watt_sensor
+      name: "Grid: Consumption (Watt)"
+    update_interval: 2.8s
+    modbus_id: modbus_pzemac
+    address: 0x01
+
+  - platform: pzemac
+    power:
+      id: photovoltaic_production_watt_sensor
+      name: "Grid: Production (Watt)"
+    update_interval: 3.2s
+    modbus_id: modbus_pzemac
+    address: 0x03
+
+  - platform: rp6000
+    rp6000_id: inverter
+    grid_voltage:
+      id: grid_voltage_sensor
+      name: "Inverter: Input Voltage"
+    grid_frequency:
+      name: "Inverter: Input Frequency"
+    out_voltage:
+      name: "Inverter: Out Voltage"
+    out_frequency:
+      name: "Inverter: Out Frequency"
+    battery_voltage:
+      id: battery_voltage_sensor
+      name: "Inverter: Battery Voltage"
+    battery_charge_current:
+      id: battery_charge_current_48v_sensor
+      name: "Inverter: Battery Charge Current (48v)"
+    power_volt_ampere:
+      name: "Inverter: Output Power (VA)"
+    power_watt:
+      id: house_consumption_watt_sensor
+      name: "Inverter: Output Power (Watt)"
+    load_percentage:
+      name: "Inverter: Load Percentage"
+    temperature:
+      name: "Inverter: Temperature"
+
+output:
+  - platform: rp6000
+    rp6000_id: inverter
+    current_max_charging_current:
+      id: max_charging_current
+    output_source_priority:
+      id: output_source_priority
+
+number:
+  - platform: template
+    name: "Inverter: Battery Max Charging Current (48v)"
+    id: max_charging_current_input
+    optimistic: true
+    min_value: 0
+    max_value: 50
+    step: 1
+    on_value:
+      then:
+        - output.rp6000.set_level:
+            id: max_charging_current
+            value: !lambda "return x;"
+
+  - platform: template
+    name: "Automatic Charge: Minimum Grid Feed-In (Watt)"
+    id: min_greed_feed_in_watt_input
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 300
+    step: 10
+
+select:
+  - platform: template
+    name: "Inverter: Output Source Priority"
+    id: output_source_priority_input
+    restore_value: true
+    optimistic: true
+    options:
+      - UTI (Grid First)
+      - SBU (Battery First)
+    set_action:
+      - output.rp6000.set_level:
+          id: output_source_priority
+          value: !lambda |-
+            if (x == "UTI (Grid First)") {
+              return 0;
+            } else if (x == "SBU (Battery First)") {
+              return 1;
+            } else {
+              return 0;
+            }
+
+switch:
+  - platform: template
+    name: "Automatic Charge/Source Priority Update"
+    id: enable_automatic_mode
+    icon: mdi:power
+    optimistic: true
+    assumed_state: false
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: restart
+    name: "Restart"
+
+# Report metrics to graphite server
+script:
+  - id: send_metric
+    parameters:
+      metric_name: string
+      value: float
+    then:
+      - lambda: |-
+          int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+          struct sockaddr_in destination, source;
+
+          destination.sin_family = AF_INET;
+          destination.sin_port = htons(2003);
+          destination.sin_addr.s_addr = inet_addr("192.168.1.40");
+
+          bind(sock, (struct sockaddr*)&source, sizeof(source));
+
+          std::string msg = metric_name + " " + to_string(value) + " -1";
+
+          int n_bytes = ::sendto(sock, msg.c_str(), msg.length(), 0, reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+          ESP_LOGD("StatsD", "Sent %s in %d bytes", msg.c_str(), n_bytes);
+          ::close(sock);
+
+interval:
+  - interval: 10s
+    then:
+      - script.execute:
+          id: send_metric
+          metric_name: "house.powermeter.grid_consumption_watt_sensor"
+          value: !lambda "return id(grid_consumption_watt_sensor).raw_state;"
+      - script.execute:
+          id: send_metric
+          metric_name: "house.powermeter.photovoltaic_production_watt_sensor"
+          value: !lambda "return id(photovoltaic_production_watt_sensor).raw_state;"
+      - script.execute:
+          id: send_metric
+          metric_name: "house.powermeter.house_consumption_watt_sensor"
+          value: !lambda "return id(house_consumption_watt_sensor).raw_state;"
+      - script.execute:
+          id: send_metric
+          metric_name: "house.powermeter.battery_voltage_sensor"
+          value: !lambda "return id(battery_voltage_sensor).raw_state;"
+
+  - interval: 20s
+    then:
+      - lambda: |-
+          if (!id(enable_automatic_mode).state) {
+            return;
+          }
+
+          auto time = id(sntp_time).now();
+          if (!time.is_valid()) {
+            ESP_LOGW("automation", "Time is not valid, skip automation");
+            return;
+          }
+
+          auto sun_elevation = id(sun_position).elevation();
+          bool is_sunset = sun_elevation < 3;
+
+          uint16_t photovoltaic_watt = (uint16_t)(id(photovoltaic_production_watt_sensor).state);
+          uint16_t grid_consumption_watt = (uint16_t)(id(grid_consumption_watt_sensor).state);
+          uint16_t house_consumption_watt = (uint16_t)(id(house_consumption_watt_sensor).state);
+
+          if (photovoltaic_watt > 10000 || grid_consumption_watt > 10000) {
+            ESP_LOGW("automation", "Photovoltaic or grid consumption watt misread, skip automation");
+            return;
+          }
+
+          // Minimum amount of watt to always try to feed to the grid
+          uint16_t min_ssp_excange_watt = (uint16_t)(id(min_greed_feed_in_watt_input).state);
+
+          uint16_t current_max_charging_current = (uint16_t)(id(max_charging_current_input).state);
+          uint16_t battery_charge_current = (uint16_t)(id(battery_charge_current_48v_sensor).state);
+
+          int16_t delta_watt = photovoltaic_watt - grid_consumption_watt - min_ssp_excange_watt;
+
+          int16_t wanted_max_charging_current = calculate_next_max_charging_current(current_max_charging_current, delta_watt);
+
+          // Charger should start gradually or the house breaker trips
+          if (battery_charge_current < 5) {
+            wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
+          }
+
+          ESP_LOGI("automation", "Current max charging current: %d, next max charging current: %d for delta_watt: %d", current_max_charging_current, wanted_max_charging_current, delta_watt);
+
+          if (wanted_max_charging_current != current_max_charging_current){
+            auto call = id(max_charging_current_input).make_call();
+            call.set_value(wanted_max_charging_current);
+            call.perform();
+            ESP_LOGI("automation", "Set max charging current to %d, photovoltaic_watt: %d, grid_consumption_watt: %d", wanted_max_charging_current, photovoltaic_watt, grid_consumption_watt);
+          }
+
+          // Regulate output source priority based on sun position and photovoltaic production
+          char* wanted_output_source_priority;
+          if (is_sunset) {
+            if (house_consumption_watt > photovoltaic_watt) {
+            wanted_output_source_priority = "SBU (Battery First)";
+            } else {
+              // do nothing
+              return;
+            }
+          } else {
+            if (photovoltaic_watt > house_consumption_watt) {
+              wanted_output_source_priority = "UTI (Grid First)";
+            } else {
+              // do nothing
+              return;
+            }
+          }
+
+          if (strcmp(id(output_source_priority_input).state.c_str(), wanted_output_source_priority) != 0) {
+            auto call = id(output_source_priority_input).make_call();
+            call.set_option(wanted_output_source_priority);
+            call.perform();
+            ESP_LOGI("automation", "Set output source priority to %s, photovoltaic_watt: %d, grid_consumption_watt: %d", wanted_output_source_priority, photovoltaic_watt, grid_consumption_watt);
+          }
