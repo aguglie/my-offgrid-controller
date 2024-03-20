@@ -280,6 +280,11 @@ interval:
           }
 
           // Regulate output source priority based on sun position and photovoltaic production
+          if (house_consumption_watt > 480){
+            // do nothing, prevent relay switch on high current
+            return;
+          }
+
           char* wanted_output_source_priority;
           if (is_sunset) {
             if (house_consumption_watt > photovoltaic_watt) {
