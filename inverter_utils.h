@@ -5,8 +5,8 @@
 
 uint16_t measured_absorptions_matrix[MEASURED_ABSORPTIONS] = {
     0,   // 0A
-    287, // 1A
-    330, // 2A
+    170, // 1A --> 1A is unstable
+    325, // 2A
     373, // ...
     415,
     458,

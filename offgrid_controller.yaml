@@ -27,7 +27,8 @@ web_server:
   ota: false
 
 ota:
-  password: ""
+  - platform: esphome
+    password: ""
 
 api:
   reboot_timeout: "0s"
@@ -243,12 +244,16 @@ interval:
             return;
           }
 
-          auto sun_elevation = id(sun_position).elevation();
-          bool is_sunset = sun_elevation < 3;
-
           uint16_t photovoltaic_watt = (uint16_t)(id(photovoltaic_production_watt_sensor).state);
           uint16_t grid_consumption_watt = (uint16_t)(id(grid_consumption_watt_sensor).state);
           uint16_t house_consumption_watt = (uint16_t)(id(house_consumption_watt_sensor).state);
+          float battery_voltage = (float)(id(battery_voltage_sensor).state);
+
+          auto sun_elevation = id(sun_position).elevation();
+          bool is_sunset = sun_elevation < 12;
+          bool can_switch_to_sbu = battery_voltage > 52.5;
+          bool better_switch_to_grid = battery_voltage < 51.2;
+          bool is_really_low_battery = battery_voltage < 48.5;
 
           if (photovoltaic_watt > 10000 || grid_consumption_watt > 10000) {
             ESP_LOGW("automation", "Photovoltaic or grid consumption watt misread, skip automation");
@@ -270,6 +275,11 @@ interval:
             wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
           }
 
+          if (is_really_low_battery) {
+            wanted_max_charging_current = fmax(wanted_max_charging_current, 2);
+            ESP_LOGW("automation", "Battery voltage low, will recharge anyway");
+          }
+
           ESP_LOGI("automation", "Current max charging current: %d, next max charging current: %d for delta_watt: %d", current_max_charging_current, wanted_max_charging_current, delta_watt);
 
           if (wanted_max_charging_current != current_max_charging_current){
@@ -287,7 +297,7 @@ interval:
 
           char* wanted_output_source_priority;
           if (is_sunset) {
-            if (house_consumption_watt > photovoltaic_watt) {
+            if (house_consumption_watt > photovoltaic_watt && can_switch_to_sbu) {
             wanted_output_source_priority = "SBU (Battery First)";
             } else {
               // do nothing
@@ -300,6 +310,11 @@ interval:
               // do nothing
               return;
             }
+          }
+
+          if (better_switch_to_grid) {
+            ESP_LOGW("automation", "Battery voltage low, force switch to grid");
+            wanted_output_source_priority = "UTI (Grid First)";
           }
 
           if (strcmp(id(output_source_priority_input).state.c_str(), wanted_output_source_priority) != 0) {
