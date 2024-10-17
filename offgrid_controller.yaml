@@ -298,17 +298,11 @@ interval:
           char* wanted_output_source_priority;
           if (is_sunset) {
             if (house_consumption_watt > photovoltaic_watt && can_switch_to_sbu) {
-            wanted_output_source_priority = "SBU (Battery First)";
-            } else {
-              // do nothing
-              return;
+              wanted_output_source_priority = "SBU (Battery First)";
             }
           } else {
             if (photovoltaic_watt > house_consumption_watt) {
               wanted_output_source_priority = "UTI (Grid First)";
-            } else {
-              // do nothing
-              return;
             }
           }
 
