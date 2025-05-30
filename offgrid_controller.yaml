@@ -1,9 +1,10 @@
 esphome:
   name: offgrid_controller
-  platform: ESP32
-  board: esp32-poe
   includes:
     - inverter_utils.h
+
+esp32:
+  board: esp32-poe
 
 external_components:
   - source: github://aguglie/esphome-rp6000@main
@@ -316,4 +317,27 @@ interval:
             call.set_option(wanted_output_source_priority);
             call.perform();
             ESP_LOGI("automation", "Set output source priority to %s, photovoltaic_watt: %d, grid_consumption_watt: %d", wanted_output_source_priority, photovoltaic_watt, grid_consumption_watt);
+          }
+
+  # Resend output source priority every 5 minutes to ensure the inverter matches the esphome state
+  - interval: 308s
+    then:
+      - lambda: |-
+          auto current_state = id(output_source_priority_input).state;
+          auto call = id(output_source_priority_input).make_call();
+          call.set_option(current_state);
+          call.perform();
+          ESP_LOGI("timeout", "Resent current output source priority: %s", current_state.c_str());
+
+  # Resend max charging current every 5 minutes when in UTI mode to ensure the inverter matches the esphome charging current
+  - interval: 316s
+    then:
+      - lambda: |-
+          auto current_priority = id(output_source_priority_input).state;
+          if (strcmp(current_priority.c_str(), "UTI (Grid First)") == 0) {
+            auto current_max_charging = id(max_charging_current_input).state;
+            auto call = id(max_charging_current_input).make_call();
+            call.set_value(current_max_charging);
+            call.perform();
+            ESP_LOGI("timeout", "Resent current max charging current: %d (UTI mode)", current_max_charging);
           }
