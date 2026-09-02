@@ -240,10 +240,16 @@ interval:
           uint16_t min_ssp_excange_watt = (uint16_t)(id(min_greed_feed_in_watt_input).state);
 
           uint16_t current_max_charging_current = (uint16_t)(id(max_charging_current_input).state);
+          uint16_t battery_charge_current = (uint16_t)(id(battery_charge_current_48v_sensor).state);
 
           int16_t delta_watt = photovoltaic_watt - grid_consumption_watt - min_ssp_excange_watt;
 
           int16_t wanted_max_charging_current = calculate_next_max_charging_current(current_max_charging_current, delta_watt);
+
+          // Start the charger gradually: wait for it to stabilize at 10 A before allowing higher currents
+          if (battery_charge_current < 5) {
+            wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
+          }
 
           if (is_really_low_battery) {
             wanted_max_charging_current = fmax(wanted_max_charging_current, 2);
