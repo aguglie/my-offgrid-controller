@@ -240,20 +240,33 @@ interval:
           uint16_t min_ssp_excange_watt = (uint16_t)(id(min_greed_feed_in_watt_input).state);
 
           uint16_t current_max_charging_current = (uint16_t)(id(max_charging_current_input).state);
-          uint16_t battery_charge_current = (uint16_t)(id(battery_charge_current_48v_sensor).state);
+          float measured_battery_charge_current = id(battery_charge_current_48v_sensor).state;
+
+          if (isnan(measured_battery_charge_current) || measured_battery_charge_current < 0 || measured_battery_charge_current > 50) {
+            ESP_LOGW("automation", "Battery charge current misread, skip automation");
+            return;
+          }
+
+          uint16_t battery_charge_current = (uint16_t)(roundf(measured_battery_charge_current));
 
           int16_t delta_watt = photovoltaic_watt - grid_consumption_watt - min_ssp_excange_watt;
 
-          int16_t wanted_max_charging_current = calculate_next_max_charging_current(current_max_charging_current, delta_watt);
+          int16_t wanted_max_charging_current = calculate_next_max_charging_current(battery_charge_current, delta_watt);
 
-          // Start the charger gradually: wait for it to stabilize at 10 A before allowing higher currents
-          if (battery_charge_current < 5) {
+          // Do not exceed 10 A until the inverter is actually charging at 10 A
+          if (measured_battery_charge_current < 10) {
             wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
           }
 
           if (is_really_low_battery) {
             wanted_max_charging_current = fmax(wanted_max_charging_current, 2);
             ESP_LOGW("automation", "Battery voltage low, will recharge anyway");
+          }
+
+          // Increases must wait for the inverter to reach the previous setpoint; decreases remain immediate
+          if (wanted_max_charging_current > current_max_charging_current && measured_battery_charge_current < current_max_charging_current) {
+            ESP_LOGI("automation", "Hold charging current at %d A while inverter catches up (measured: %.1f A)", current_max_charging_current, measured_battery_charge_current);
+            wanted_max_charging_current = current_max_charging_current;
           }
 
           ESP_LOGI("automation", "Current max charging current: %d, next max charging current: %d for delta_watt: %d", current_max_charging_current, wanted_max_charging_current, delta_watt);
