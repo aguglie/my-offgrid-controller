@@ -253,8 +253,8 @@ interval:
 
           int16_t wanted_max_charging_current = calculate_next_max_charging_current(battery_charge_current, delta_watt);
 
-          // Do not exceed 10 A until the inverter is actually charging at 10 A
-          if (measured_battery_charge_current < 10) {
+          // Do not exceed 10 A until the inverter is actually charging at least 8 A
+          if (measured_battery_charge_current < 8) {
             wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
           }
 
@@ -263,8 +263,8 @@ interval:
             ESP_LOGW("automation", "Battery voltage low, will recharge anyway");
           }
 
-          // Increases must wait for the inverter to reach the previous setpoint; decreases remain immediate
-          if (wanted_max_charging_current > current_max_charging_current && measured_battery_charge_current < current_max_charging_current) {
+          // Increases must wait for the inverter to get within 3 A of the previous setpoint; decreases remain immediate
+          if (wanted_max_charging_current > current_max_charging_current && measured_battery_charge_current + 3 < current_max_charging_current) {
             ESP_LOGI("automation", "Hold charging current at %d A while inverter catches up (measured: %.1f A)", current_max_charging_current, measured_battery_charge_current);
             wanted_max_charging_current = current_max_charging_current;
           }
