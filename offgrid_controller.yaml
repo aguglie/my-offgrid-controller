@@ -2,12 +2,31 @@ esphome:
   name: offgrid_controller
   includes:
     - inverter_utils.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(max_charging_current).set_ack_callback([](float value) {
+            id(max_charging_current_input).publish_state(value);
+          });
+          id(output_source_priority).set_ack_callback([](float value) {
+            id(output_source_priority_input).publish_state(value == 0 ? "UTI (Grid First)" : "SBU (Battery First)");
+          });
+          // Establish a confirmed charging limit after each controller restart.
+          id(max_charging_current).set_value(0);
+          id(output_source_priority).set_value(id(output_source_priority_input).state == "SBU (Battery First)" ? 1 : 0);
 
 esp32:
   board: esp32-poe
+  framework:
+    type: arduino
+    version: 2.0.5
+    platform_version: 5.4.0
 
 external_components:
   - source: github://aguglie/esphome-rp6000@main
+    components: [rp6000]
+    refresh: 0s
 
 web_server:
   port: 80
@@ -44,9 +63,10 @@ uart:
       direction: BOTH
       dummy_receiver: false
       after:
-        delimiter: "\n"
+        delimiter: "\r"
       sequence:
-        - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+        - lambda: |-
+            ESP_LOGD("uart_debug", "%s %s", direction == uart::UART_DIRECTION_TX ? ">>>" : "<<<", format_hex_pretty(bytes).c_str());
 
   - id: pzm_uart
     tx_pin: 14
@@ -122,15 +142,15 @@ number:
   - platform: template
     name: "Inverter: Battery Max Charging Current (48v)"
     id: max_charging_current_input
-    optimistic: true
+    optimistic: false
+    lambda: return id(max_charging_current).get_confirmed_value();
     min_value: 0
     max_value: 50
     step: 1
-    on_value:
-      then:
-        - output.rp6000.set_level:
-            id: max_charging_current
-            value: !lambda "return x;"
+    set_action:
+      - output.rp6000.set_level:
+          id: max_charging_current
+          value: !lambda "return x;"
 
   - platform: template
     name: "Automatic Charge: Minimum Grid Feed-In (Watt)"
@@ -147,7 +167,7 @@ select:
     name: "Inverter: Output Source Priority"
     id: output_source_priority_input
     restore_value: true
-    optimistic: true
+    optimistic: false
     options:
       - UTI (Grid First)
       - SBU (Battery First)
@@ -225,6 +245,18 @@ interval:
             return;
           }
 
+          if (!id(inverter).has_fresh_status() || id(max_charging_current).is_pending() ||
+              !std::isfinite(id(max_charging_current).get_confirmed_value())) {
+            ESP_LOGW("automation", "Waiting for fresh inverter status and a confirmed charging limit");
+            return;
+          }
+          if (!std::isfinite(id(photovoltaic_production_watt_sensor).state) ||
+              !std::isfinite(id(grid_consumption_watt_sensor).state) ||
+              !std::isfinite(id(battery_voltage_sensor).state)) {
+            ESP_LOGW("automation", "Missing power or battery measurements");
+            return;
+          }
+
           uint16_t photovoltaic_watt = (uint16_t)(id(photovoltaic_production_watt_sensor).state);
           uint16_t grid_consumption_watt = (uint16_t)(id(grid_consumption_watt_sensor).state);
           float battery_voltage = (float)(id(battery_voltage_sensor).state);
@@ -239,7 +271,7 @@ interval:
           // Minimum amount of watt to always try to feed to the grid
           uint16_t min_ssp_excange_watt = (uint16_t)(id(min_greed_feed_in_watt_input).state);
 
-          uint16_t current_max_charging_current = (uint16_t)(id(max_charging_current_input).state);
+          uint16_t current_max_charging_current = (uint16_t)(id(max_charging_current).get_confirmed_value());
           float measured_battery_charge_current = id(battery_charge_current_48v_sensor).state;
 
           if (isnan(measured_battery_charge_current) || measured_battery_charge_current < 0 || measured_battery_charge_current > 50) {
@@ -247,15 +279,14 @@ interval:
             return;
           }
 
-          uint16_t battery_charge_current = (uint16_t)(roundf(measured_battery_charge_current));
-
           int16_t delta_watt = photovoltaic_watt - grid_consumption_watt - min_ssp_excange_watt;
 
-          int16_t wanted_max_charging_current = calculate_next_max_charging_current(battery_charge_current, delta_watt);
+          // Correct the ACK-confirmed setpoint; measured current is only used for settling guards.
+          int16_t wanted_max_charging_current = calculate_next_max_charging_current(current_max_charging_current, delta_watt);
 
-          // Do not exceed 10 A until the inverter is actually charging at least 8 A
-          if (measured_battery_charge_current < 8) {
-            wanted_max_charging_current = fmin(wanted_max_charging_current, 10);
+          // Limit startup increases without reducing an existing setpoint during a current dip.
+          if (measured_battery_charge_current < 8 && wanted_max_charging_current > current_max_charging_current) {
+            wanted_max_charging_current = fmin(wanted_max_charging_current, fmax(10, current_max_charging_current));
           }
 
           if (is_really_low_battery) {
@@ -269,24 +300,25 @@ interval:
             wanted_max_charging_current = current_max_charging_current;
           }
 
-          ESP_LOGI("automation", "Current max charging current: %d, next max charging current: %d for delta_watt: %d", current_max_charging_current, wanted_max_charging_current, delta_watt);
+          ESP_LOGI("automation", "Current max charging current: %d, next max charging current: %d for delta_watt: %d (ACK-confirmed base, measured: %.1f A)", current_max_charging_current, wanted_max_charging_current, delta_watt, measured_battery_charge_current);
 
           if (wanted_max_charging_current != current_max_charging_current){
             auto call = id(max_charging_current_input).make_call();
             call.set_value(wanted_max_charging_current);
             call.perform();
-            ESP_LOGI("automation", "Set max charging current to %d, photovoltaic_watt: %d, grid_consumption_watt: %d", wanted_max_charging_current, photovoltaic_watt, grid_consumption_watt);
+            ESP_LOGI("automation", "Requested max charging current %d, photovoltaic_watt: %d, grid_consumption_watt: %d", wanted_max_charging_current, photovoltaic_watt, grid_consumption_watt);
           }
 
   # Resend output source priority every 5 minutes to ensure the inverter matches the esphome state
   - interval: 308s
     then:
       - lambda: |-
+          if (id(output_source_priority).is_pending()) return;
           auto current_state = id(output_source_priority_input).state;
           auto call = id(output_source_priority_input).make_call();
           call.set_option(current_state);
           call.perform();
-          ESP_LOGI("timeout", "Resent current output source priority: %s", current_state.c_str());
+          ESP_LOGI("timeout", "Requested output source priority sync: %s", current_state.c_str());
 
   # Resend max charging current every 5 minutes when in UTI mode to ensure the inverter matches the esphome charging current
   - interval: 316s
@@ -294,9 +326,11 @@ interval:
       - lambda: |-
           auto current_priority = id(output_source_priority_input).state;
           if (strcmp(current_priority.c_str(), "UTI (Grid First)") == 0) {
-            auto current_max_charging = id(max_charging_current_input).state;
+            if (id(max_charging_current).is_pending()) return;
+            auto current_max_charging = id(max_charging_current).get_confirmed_value();
+            if (!std::isfinite(current_max_charging)) return;
             auto call = id(max_charging_current_input).make_call();
             call.set_value(current_max_charging);
             call.perform();
-            ESP_LOGI("timeout", "Resent current max charging current: %d (UTI mode)", current_max_charging);
+            ESP_LOGI("timeout", "Requested max charging current sync: %.0f (UTI mode)", current_max_charging);
           }
